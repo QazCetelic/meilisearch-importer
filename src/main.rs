@@ -48,8 +48,8 @@ struct Opt {
     api_key: Option<String>,
 
     /// The delimiter to use for the CSV files.
-    #[structopt(long, default_value_t = b',')]
-    csv_delimiter: u8,
+    #[structopt(long, default_value_t = ',')]
+    csv_delimiter: char,
 
     /// Defines whether we send the embeddings to the remote server or do not send a single embedding.
     #[structopt(long)]
@@ -155,6 +155,9 @@ fn send_data(
 
 fn main() -> anyhow::Result<()> {
     let opt = Opt::parse();
+    if !opt.csv_delimiter.is_ascii() { // non-ASCII can cause issues with u8 cast
+        anyhow::bail!("The CSV delimiter must be an ASCII character");
+    }
     let agent = AgentBuilder::new().timeout(Duration::from_secs(30)).build();
     let files = match opt.stdin {
         Some(_) => vec![PathBuf::from("-")],
@@ -227,7 +230,7 @@ fn main() -> anyhow::Result<()> {
                 thread::scope(|s| {
                     let (tx, rx) = std::sync::mpsc::sync_channel(100);
                     let producer_handle = s.spawn(move || {
-                        for chunk in csv::CsvChunker::new(path, size, opt.csv_delimiter) {
+                        for chunk in csv::CsvChunker::new(path, size, opt.csv_delimiter as u8) {
                             tx.send(chunk)?;
                         }
                         Ok(()) as anyhow::Result<()>
