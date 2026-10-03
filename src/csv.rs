@@ -3,7 +3,7 @@ use std::io::{self, Read};
 use std::mem;
 use std::path::{Path, PathBuf};
 
-use csv::{ByteRecord, WriterBuilder};
+use csv::{ByteRecord, ReaderBuilder, WriterBuilder};
 
 pub struct CsvChunker {
     pub(crate) reader: csv::Reader<Box<dyn Read>>,
@@ -22,8 +22,8 @@ impl CsvChunker {
         } else {
             Box::new(File::open(path).unwrap())
         };
-        let mut reader = csv::Reader::from_reader(reader);
-        let mut writer = WriterBuilder::new().delimiter(delimiter).from_writer(Vec::new());
+        let mut reader = ReaderBuilder::new().delimiter(delimiter).from_reader(reader);
+        let mut writer = WriterBuilder::new().from_writer(Vec::new());
         let headers = reader.byte_headers().unwrap().clone();
         writer.write_byte_record(&headers).unwrap();
         Self {
