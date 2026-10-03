@@ -2,6 +2,7 @@ use std::io::prelude::*;
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
+use std::sync::Mutex;
 use std::time::Duration;
 use std::{fs, thread};
 
@@ -15,6 +16,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use mime::Mime;
 use rayon::iter::{ParallelBridge as _, ParallelIterator};
 use rayon::{ThreadPool, ThreadPoolBuilder};
+use serde::Deserialize;
 use ureq::{Agent, AgentBuilder};
 
 mod byte_count;
@@ -79,6 +81,10 @@ struct Opt {
     #[structopt(long)]
     skip_batches: Option<u64>,
 
+    /// Wait until all uploaded tasks have succeeded.
+    #[arg(long)]
+    check: bool,
+
     /// Tells us to read data from stdin and to use the provided format.
     #[structopt(long, conflicts_with("files"))]
     stdin: Option<Mime>,
@@ -100,6 +106,30 @@ enum DocumentOperation {
     AddOrUpdate,
 }
 
+#[derive(Deserialize)]
+struct UploadResponse {
+    #[serde(rename = "taskUid", alias = "uid")]
+    task_uid: u64,
+}
+
+#[derive(Deserialize)]
+struct ApiError {
+    message: String,
+}
+
+#[derive(Deserialize)]
+struct TaskList {
+    results: Vec<Task>,
+}
+
+#[derive(Deserialize)]
+struct Task {
+    #[serde(alias = "taskUid")]
+    uid: u64,
+    status: String,
+    error: Option<ApiError>,
+}
+
 fn send_data(
     opt: &Opt,
     agent: &Agent,
@@ -107,6 +137,7 @@ fn send_data(
     pb: &ProgressBar,
     mime: &Mime,
     data: &[u8],
+    task_uids: &Mutex<Vec<u64>>,
 ) -> anyhow::Result<()> {
     let api_key = opt.api_key.clone();
     let mut url = format!("{}/indexes/{}/documents", opt.url, opt.index);
@@ -137,11 +168,21 @@ fn send_data(
         }
 
         match request.send_bytes(&data) {
-            Ok(response) if matches!(response.status(), 200..=299) => return Ok(()),
+            Ok(response) if matches!(response.status(), 200..=299) => {
+                let body = response.into_string()?;
+                let response: UploadResponse = serde_json::from_str(&body)
+                    .context("Could not parse the document upload response")?;
+                task_uids
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Task UID collection lock was poisoned"))?
+                    .push(response.task_uid);
+                return Ok(());
+            }
             Ok(response) => {
-                let e = response.into_string()?;
-                pb.println(format!("Attempt #{attempt}: {e}"));
-                thread::sleep(duration);
+                anyhow::bail!("Meilisearch rejected the upload: {}", response_error(response));
+            }
+            Err(ureq::Error::Status(_, response)) => {
+                anyhow::bail!("Meilisearch rejected the upload: {}", response_error(response));
             }
             Err(e) => {
                 pb.println(format!("Attempt #{attempt}: {e}"));
@@ -159,6 +200,7 @@ fn main() -> anyhow::Result<()> {
         anyhow::bail!("The CSV delimiter must be an ASCII character");
     }
     let agent = AgentBuilder::new().timeout(Duration::from_secs(30)).build();
+    let task_uids = Mutex::new(Vec::new());
     let files = match opt.stdin {
         Some(_) => vec![PathBuf::from("-")],
         None => opt.files.clone(),
@@ -203,7 +245,7 @@ fn main() -> anyhow::Result<()> {
             Mime::Json => {
                 if opt.skip_batches.zip(pb.length()).map_or(true, |(s, l)| s > l) {
                     let data = fs::read_to_string(path)?;
-                    send_data(&opt, &agent, opt.upload_operation, &pb, &mime, data.as_bytes())?;
+                    send_data(&opt, &agent, opt.upload_operation, &pb, &mime, data.as_bytes(), &task_uids)?;
                 }
                 pb.inc(1);
             }
@@ -217,8 +259,7 @@ fn main() -> anyhow::Result<()> {
                         Ok(()) as anyhow::Result<()>
                     });
 
-                    let sender_handle =
-                        s.spawn(|| send_producer_in_parallel(&opt, &agent, &pb, &pool, &mime, rx));
+                    let sender_handle = s.spawn(|| send_producer_in_parallel(&opt, &agent, &pb, &pool, &mime, rx, &task_uids));
 
                     producer_handle.join().unwrap()?;
                     sender_handle.join().unwrap()?;
@@ -236,8 +277,7 @@ fn main() -> anyhow::Result<()> {
                         Ok(()) as anyhow::Result<()>
                     });
 
-                    let sender_handle =
-                        s.spawn(|| send_producer_in_parallel(&opt, &agent, &pb, &pool, &mime, rx));
+                    let sender_handle = s.spawn(|| send_producer_in_parallel(&opt, &agent, &pb, &pool, &mime, rx, &task_uids));
 
                     producer_handle.join().unwrap()?;
                     sender_handle.join().unwrap()?;
@@ -247,6 +287,9 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
+
+    let task_uids = task_uids.into_inner().unwrap();
+    check_tasks(&opt, &agent, &task_uids, opt.check)?;
 
     Ok(())
 }
@@ -258,14 +301,90 @@ fn send_producer_in_parallel(
     pool: &ThreadPool,
     mime: &Mime,
     rx: Receiver<Vec<u8>>,
+    task_uids: &Mutex<Vec<u64>>,
 ) -> anyhow::Result<()> {
     pool.install(|| {
         rx.into_iter().par_bridge().try_for_each(|chunk| {
             if opt.skip_batches.zip(pb.length()).map_or(true, |(s, l)| s > l) {
-                send_data(&opt, &agent, opt.upload_operation, &pb, &mime, &chunk)?;
+                send_data(&opt, &agent, opt.upload_operation, &pb, &mime, &chunk, task_uids)?;
             }
             pb.inc(1);
             Ok(()) as anyhow::Result<()>
         })
     })
+}
+
+fn response_error(response: ureq::Response) -> String {
+    let body = response.into_string().unwrap_or_default();
+    serde_json::from_str::<ApiError>(&body)
+        .map(|error| error.message)
+        .unwrap_or(body)
+}
+
+fn check_tasks(opt: &Opt, agent: &Agent, task_uids: &[u64], wait: bool) -> anyhow::Result<()> {
+    if task_uids.is_empty() {
+        return Ok(());
+    }
+
+    let mut pending = task_uids.to_vec();
+    pending.sort_unstable();
+
+    loop {
+        let mut still_pending = Vec::new();
+        for batch in pending.chunks(100) {
+            let uids = batch.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+            let mut request = agent.get(&format!("{}/tasks?uids={uids}", opt.url));
+            if let Some(api_key) = &opt.api_key {
+                request = request.set("Authorization", &format!("Bearer {api_key}"));
+            }
+            let response = match request.call() {
+                Ok(response) => response,
+                Err(ureq::Error::Status(_, response)) => {
+                    anyhow::bail!("Could not check Meilisearch task statuses: {}", response_error(response));
+                }
+                Err(error) => return Err(error.into()),
+            }
+            .into_string()?;
+            let response: TaskList = serde_json::from_str(&response)
+                .context("Could not parse the task status response")?;
+
+            let mut checked_uids = Vec::with_capacity(response.results.len());
+            for task in response.results {
+                checked_uids.push(task.uid);
+                match task.status.as_str() {
+                    "succeeded" => {}
+                    "failed" | "canceled" => {
+                        let message = task
+                            .error
+                            .map(|error| error.message)
+                            .unwrap_or_else(|| "no error details provided".to_owned());
+                        anyhow::bail!("Meilisearch task {} {}: {message}", task.uid, task.status);
+                    }
+                    "enqueued" | "processing" => still_pending.push(task.uid),
+                    other => anyhow::bail!(
+                        "Meilisearch task {} returned unexpected status {other:?}",
+                        task.uid
+                    ),
+                }
+            }
+
+            checked_uids.sort_unstable();
+            if checked_uids != batch {
+                anyhow::bail!("Meilisearch did not return the status of every enqueued task");
+            }
+        }
+
+        if still_pending.is_empty() {
+            return Ok(());
+        }
+        if !wait {
+            eprintln!("{} tasks are still enqueued or processing.", still_pending.len());
+            return Ok(());
+        }
+
+        eprintln!("Waiting for {} tasks to finish...", still_pending.len());
+        still_pending.sort_unstable();
+        pending = still_pending;
+        thread::sleep(Duration::from_secs(1));
+    }
 }
